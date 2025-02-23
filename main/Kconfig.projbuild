@@ -1,0 +1,15 @@
+menu " WIFI CONFIGURATION"
+
+    config WIFI_SSID
+        string "SSID da rede Wi-Fi"
+        default "MinhaRedeWiFi"
+        help
+            Defina aqui o SSID da sua rede Wi-Fi
+
+    config WIFI_PASS
+        string "Senha da rede Wi-Fi"
+        default "MinhaSenhaWiFi"
+        help
+            Defina aqui a senha da sua rede Wi-Fi
+
+endmenu
