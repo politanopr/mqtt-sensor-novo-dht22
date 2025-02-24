@@ -10,9 +10,9 @@
 #include "nvs_flash.h"
 #include "mqtt_client.h"
 #include "esp_log.h"
-#include "cJSON.h"  
 #include "dht.h"   //  Biblioteca do DHT22 
 #include "sdkconfig.h"  // Inclui as configurações definidas no menuconfig
+#include "driver/gpio.h"
 
 
 
@@ -29,15 +29,25 @@ static int num_tentativas = 0;
 
 //  Configurações MQTT
 #define MQTT_BROKER   "mqtt://broker.emqx.io"
-#define MQTT_PUBLISH_TOPIC "esp32/test"
 #define MQTT_SUBSCRIBE_TOPIC "esp32/command"
 #define MQTT_SENSOR_TOPIC "esp32/sensor"  //  Novo tópico para os dados do DHT22
+#define MQTT_ALARM_TOPIC "esp32/alarm"
+
 
 //  Configurações do DHT22
-#define DHT_PIN GPIO_NUM_4  //  Altere para o pino correto do seu ESP32
+#define DHT_PIN GPIO_NUM_4      // Sensor
+#define LED_GPIO GPIO_NUM_2      //LED 
+
 
 static const char *TAG = "ESP32_MQTT";
 static esp_mqtt_client_handle_t cliente;
+
+void configure_led() {
+    gpio_reset_pin(LED_GPIO);
+    gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_level(LED_GPIO, 0);  // LED começa desligado
+}
+
 
 //  Manipulador de eventos Wi-Fi
 static void wifi_evento_manipulador(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
@@ -103,6 +113,17 @@ static void wifi_init(void) {
     }
 }
 
+//  Envia alertas MQTT
+void send_alarm(const char *alert_type, float value) {
+    char message[100];
+    snprintf(message, sizeof(message), "Alerta: %s | Valor: %.1f", alert_type, value);
+    esp_mqtt_client_publish(cliente, MQTT_ALARM_TOPIC, message, 0, 0, 0);
+    ESP_LOGW(TAG, " ALARME: %s", message);
+}
+
+
+
+
 //  Função para ler e enviar dados do DHT22 via MQTT
 void dht22_task(void *pvParameter) {
     while (1) {
@@ -114,26 +135,42 @@ void dht22_task(void *pvParameter) {
             float hum_percent = humidity / 10.0;
             ESP_LOGI(TAG, "🌡️ Temperatura: %.1f°C  💧 Umidade: %.1f%%", temp_celsius, hum_percent);
 
-            //  Cria o JSON
-            cJSON *json = cJSON_CreateObject();
-            cJSON_AddNumberToObject(json, "temperatura", temp_celsius);
-            cJSON_AddNumberToObject(json, "umidade", hum_percent);
-            char *json_string = cJSON_PrintUnformatted(json);
+            char sensor_msg[100];
+            snprintf(sensor_msg, sizeof(sensor_msg), "Temp: %.1f°C | Umid: %.1f%%", temp_celsius, hum_percent);
+            esp_mqtt_client_publish(cliente, MQTT_SENSOR_TOPIC, sensor_msg, 0, 0, 0);
 
-            //  Envia para o broker MQTT
-            esp_mqtt_client_publish(cliente, MQTT_SENSOR_TOPIC, json_string, 0, 1, 0);
-            ESP_LOGI(TAG, "📤 Dados enviados para o broker: %s", json_string);
-
-            //  Libera memória
-            cJSON_Delete(json);
-            free(json_string);
-        } else {
+            //  Verifica alertas
+            if (temp_celsius > 25.0) {
+                send_alarm("Alta Temp", temp_celsius);
+            }
+            if (hum_percent < 50.0) {
+                send_alarm("Baixa Umidade", hum_percent);
+            }
+        }else {
             ESP_LOGE(TAG, "Falha ao ler o DHT22!");
         }
 
         vTaskDelay(pdMS_TO_TICKS(60000));  //  Aguarda 60 segundos antes da próxima leitura
     }
 }
+
+
+void trim_whitespace(char *str) {
+    char *end;
+
+    // Remove espaços e quebras de linha do início
+    while (*str == ' ' || *str == '\n' || *str == '\r') {
+        str++;
+    }
+
+    // Remove espaços e quebras de linha do final
+    end = str + strlen(str) - 1;
+    while (end > str && (*end == ' ' || *end == '\n' || *end == '\r')) {
+        *end = '\0';
+        end--;
+    }
+}
+
 
 //  Manipulador de eventos MQTT
 static void mqtt_evento_manipulador(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data) {
@@ -143,8 +180,8 @@ static void mqtt_evento_manipulador(void *handler_args, esp_event_base_t base, i
     switch (event_id) {
         case MQTT_EVENT_CONNECTED:
             ESP_LOGI(TAG, " Conectado ao broker MQTT!");
-            esp_mqtt_client_subscribe(cliente, MQTT_SUBSCRIBE_TOPIC, 1);
-            esp_mqtt_client_publish(cliente, MQTT_PUBLISH_TOPIC, "ESP32 conectado!", 0, 1, 0);
+            esp_mqtt_client_subscribe(cliente, MQTT_SUBSCRIBE_TOPIC, 0);
+            
             break;
         case MQTT_EVENT_DISCONNECTED:
             ESP_LOGW(TAG, "Desconectado do broker MQTT!");
@@ -152,10 +189,31 @@ static void mqtt_evento_manipulador(void *handler_args, esp_event_base_t base, i
         case MQTT_EVENT_PUBLISHED:
             ESP_LOGI(TAG, "Mensagem publicada com sucesso!");
             break;
+        
         case MQTT_EVENT_DATA:
-            ESP_LOGI(TAG, "Mensagem recebida! Tópico: %.*s", event->topic_len, event->topic);
-            ESP_LOGI(TAG, "Payload recebido: %.*s", event->data_len, event->data);
+        char comando[100];
+        snprintf(comando, sizeof(comando), "%.*s", event->data_len, event->data);
+        comando[event->data_len] = '\0';  // Garante que a string termine corretamente
+
+        trim_whitespace(comando);  // 🔹 Remove espaços e quebras de linha
+
+        // Comparação correta sem espaços ou quebras de linha extras
+        if (strcmp(comando, "LED_ON") == 0) {
+            ESP_LOGI(TAG, "💡 Comando recebido: Acender LED!");
+
+            gpio_set_level(LED_GPIO, 1);  // Liga o LED
+
+        } else if (strcmp(comando, "LED_OFF") == 0) {
+            ESP_LOGI(TAG, "💡 Comando recebido: Desligar LED!");
+
+            gpio_set_level(LED_GPIO, 0);  // Desliga o LED
+
+        } else {
+         ESP_LOGW(TAG, " Comando desconhecido: %s", comando);
+        }
             break;
+
+
         case MQTT_EVENT_ERROR:
             ESP_LOGE(TAG, " Erro no MQTT!");
             break;
@@ -180,6 +238,7 @@ static void mqtt_app_start(void) {
 //  Função principal (app_main)
 void app_main(void) {
     ESP_ERROR_CHECK(nvs_flash_init());
+    configure_led();  // Inicializa o LED
     wifi_init();
     mqtt_app_start();
 }
